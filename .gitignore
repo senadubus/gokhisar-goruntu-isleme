@@ -1,0 +1,18 @@
+# Veri setlerini görmezden gel
+*.png
+dataset-folder/
+
+# PyTorch model dosyalarını (ağırlıkları) görmezden gel
+*.pt
+*.pth
+
+# Eğer bir klasör içinde topluyorsan (checkpoint vs.)
+checkpoints/
+models/
+
+# Python yan ürünleri
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
