@@ -1,378 +1,505 @@
-import os
-import glob
 import cv2
 import numpy as np
+import math
+import time
 from ultralytics import YOLO
 
 
-# =========================
-# AYARLAR
-# =========================
-MODEL_PATH = "best.pt"          # kendi YOLO weight dosyan
-IMAGE_DIR = "images"            # 8 görselin olduğu klasör
-OUTPUT_DIR = "outputs"          # sonuçların kaydedileceği klasör
-
-CONF_THRES = 0.35
-IOU_THRES = 0.45
-
-PATCH_RATIO = 0.20              # bbox w,h'nin %20'si kadar patch
-IGNORE_ORANGE = True            # turuncu balonu ignore et
-MIN_VALID_PIXELS = 20           # patch içinde maske sonrası en az piksel
-RED_MARGIN = 0.05               # enemy kararında kırmızı baskınlık marjı
-BLUE_MARGIN = 0.05              # friend kararında mavi baskınlık marjı
-
-# aynı class'ta sadece 2 örnek varsa outlier kararı anlamsız olabilir.
-# o yüzden hem outlier hem de renk skoru birlikte kullanılıyor.
-USE_OUTLIER_LOGIC = True
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# =========================================================
+# 1) MODELİ YÜKLE
+# =========================================================
+MODEL_PATH = "best.pt"
+model = YOLO(MODEL_PATH)
 
 
-# =========================
-# YARDIMCI FONKSİYONLAR
-# =========================
-def clamp(val, low, high):
-    return max(low, min(val, high))
+# =========================================================
+# 2) HEDEF GÖRSELLERİNİ YÜKLE
+# =========================================================
+IMAGE_PATHS = [
+    "images/1.png",
+    "images/5.png",
+    "images/5.png",
+]
+
+images = []
+for p in IMAGE_PATHS:
+    img = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise FileNotFoundError(f"Görsel yüklenemedi: {p}")
+    images.append(img)
 
 
-def crop_patch(img, x1, y1, x2, y2):
-    h, w = img.shape[:2]
-    x1 = clamp(int(x1), 0, w - 1)
-    y1 = clamp(int(y1), 0, h - 1)
-    x2 = clamp(int(x2), 1, w)
-    y2 = clamp(int(y2), 1, h)
+# =========================================================
+# 3) AYARLAR
+# =========================================================
+SCREEN_W, SCREEN_H = 1280, 720
+CENTER_X, CENTER_Y = SCREEN_W // 2, SCREEN_H // 2
 
+FPS = 30
+SIM_DURATION = 12.0
+LANES = [180, 460, 780, 1080]
+
+YOLO_IMGSZ = 640
+YOLO_CONF = 0.25
+
+# Turuncu ROI (balon tespiti için)
+LOWER_ORANGE = np.array([5, 120, 120], dtype=np.uint8)
+UPPER_ORANGE = np.array([25, 255, 255], dtype=np.uint8)
+KERNEL = np.ones((5, 5), np.uint8)
+
+MIN_CONTOUR_AREA = 20
+MIN_CIRCULARITY = 0.50
+MIN_RADIUS = 2
+
+# Renk imzası — patch boyut oranı
+PATCH_RATIO = 0.20
+
+# Outlier tespiti için minimum mesafe eşiği
+# (bu kadar küçük fark gürültüdür, yok say)
+OUTLIER_MIN_DIFF = 0.02
+
+
+# =========================================================
+# 4) YARDIMCI FONKSİYONLAR (orijinal)
+# =========================================================
+def split_foreground_and_mask(img):
+    if len(img.shape) == 3 and img.shape[2] == 4:
+        bgr = img[:, :, :3]
+        alpha = img[:, :, 3]
+        return bgr, alpha
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, mask = cv2.threshold(gray, 5, 255, cv2.THRESH_BINARY)
+    return img, mask
+
+
+def overlay_safe(background, overlay_bgr, mask, x, y):
+    h, w = overlay_bgr.shape[:2]
+    y1, y2 = max(0, y), min(background.shape[0], y + h)
+    x1, x2 = max(0, x), min(background.shape[1], x + w)
+    oy1, oy2 = max(0, -y), min(h, background.shape[0] - y)
+    ox1, ox2 = max(0, -x), min(w, background.shape[1] - x)
+    if y1 >= y2 or x1 >= x2:
+        return
+    roi = background[y1:y2, x1:x2]
+    overlay_crop = overlay_bgr[oy1:oy2, ox1:ox2]
+    mask_crop = mask[oy1:oy2, ox1:ox2]
+    mask_inv = cv2.bitwise_not(mask_crop)
+    bg_part = cv2.bitwise_and(roi, roi, mask=mask_inv)
+    fg_part = cv2.bitwise_and(overlay_crop, overlay_crop, mask=mask_crop)
+    background[y1:y2, x1:x2] = cv2.add(bg_part, fg_part)
+
+
+def detect_orange_center_in_bbox(frame, bbox):
+    x1, y1, x2, y2 = bbox
+    x1 = max(0, int(x1))
+    y1 = max(0, int(y1))
+    x2 = min(frame.shape[1], int(x2))
+    y2 = min(frame.shape[0], int(y2))
     if x2 <= x1 or y2 <= y1:
         return None
-    return img[y1:y2, x1:x2].copy()
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0:
+        return None
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, LOWER_ORANGE, UPPER_ORANGE)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, KERNEL)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, KERNEL)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    largest = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(largest)
+    if area < MIN_CONTOUR_AREA:
+        return None
+    perimeter = cv2.arcLength(largest, True)
+    if perimeter == 0:
+        return None
+    circularity = 4 * math.pi * area / (perimeter * perimeter)
+    if circularity < MIN_CIRCULARITY:
+        return None
+    (cx_roi, cy_roi), radius = cv2.minEnclosingCircle(largest)
+    if radius < MIN_RADIUS:
+        return None
+    gx = int(cx_roi + x1)
+    gy = int(cy_roi + y1)
+    return {
+        "global_center": (gx, gy),
+        "roi_center": (int(cx_roi), int(cy_roi)),
+        "radius": float(radius),
+        "circularity": float(circularity),
+        "area": float(area),
+    }
 
 
-def get_corner_patches(img, box, patch_ratio=0.20):
+def draw_crosshair(frame):
+    cv2.line(frame, (CENTER_X - 20, CENTER_Y), (CENTER_X + 20, CENTER_Y), (255, 0, 0), 2)
+    cv2.line(frame, (CENTER_X, CENTER_Y - 20), (CENTER_X, CENTER_Y + 20), (255, 0, 0), 2)
+
+
+def choose_main_target(detections):
+    if not detections:
+        return None
+    best_idx = None
+    best_dist = float("inf")
+    for i, det in enumerate(detections):
+        x1, y1, x2, y2 = det["bbox"]
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        dist = math.hypot(cx - CENTER_X, cy - CENTER_Y)
+        if dist < best_dist:
+            best_dist = dist
+            best_idx = i
+    return best_idx
+
+
+# =========================================================
+# 5) RENKİMZASI FONKSİYONLARI (YENİ)
+# =========================================================
+
+def get_color_signature(frame, bbox, orange_mask_hsv=True):
     """
-    box: (x1, y1, x2, y2)
-    4 köşe patch döndürür.
+    Bbox'un 4 köşesinden patch alır, turuncu piksellerı opsiyonel olarak
+    ignore eder, normalized RGB ortalaması döner: (r, g, b) her biri [0,1].
+
+    Parametreler
+    ------------
+    frame           : BGR frame (SCREEN_H x SCREEN_W x 3)
+    bbox            : (x1, y1, x2, y2) int
+    orange_mask_hsv : True ise turuncu pikseleri (balon) ignore et
+
+    Dönen değer
+    -----------
+    np.ndarray şeklinde [r_norm, g_norm, b_norm] veya None (hesaplanamadıysa)
     """
-    x1, y1, x2, y2 = box
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+
+    # Bbox içinde kalacak şekilde sınırla
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(frame.shape[1], x2)
+    y2 = min(frame.shape[0], y2)
+
     bw = x2 - x1
     bh = y2 - y1
 
+    if bw < 10 or bh < 10:
+        return None
+
+    pw = max(4, int(bw * PATCH_RATIO))
+    ph = max(4, int(bh * PATCH_RATIO))
+
+    # 4 köşe: (sol_üst, sağ_üst, sol_alt, sağ_alt)
+    patches = [
+        frame[y1       : y1 + ph,  x1       : x1 + pw],   # sol üst
+        frame[y1       : y1 + ph,  x2 - pw  : x2      ],   # sağ üst
+        frame[y2 - ph  : y2,       x1       : x1 + pw],    # sol alt
+        frame[y2 - ph  : y2,       x2 - pw  : x2      ],   # sağ alt
+    ]
+
+    sig_accumulator = np.zeros(3, dtype=np.float64)  # (r, g, b) normalized toplam
+    valid_patch_count = 0
+
+    for patch in patches:
+        if patch.size == 0:
+            continue
+
+        # Turuncu maskeleme (opsiyonel)
+        if orange_mask_hsv:
+            hsv_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+            orange_m = cv2.inRange(hsv_patch, LOWER_ORANGE, UPPER_ORANGE)
+            # Non-orange pikselleri seç
+            valid_pixels = patch[orange_m == 0]
+        else:
+            valid_pixels = patch.reshape(-1, 3)
+
+        if len(valid_pixels) < 5:
+            continue
+
+        # BGR → float
+        B = valid_pixels[:, 0].astype(np.float64)
+        G = valid_pixels[:, 1].astype(np.float64)
+        R = valid_pixels[:, 2].astype(np.float64)
+
+        total = R + G + B
+        # Siyah pikselleri (total ≈ 0) atla
+        nonzero = total > 10
+        if nonzero.sum() < 3:
+            continue
+
+        r_norm = (R[nonzero] / total[nonzero]).mean()
+        g_norm = (G[nonzero] / total[nonzero]).mean()
+        b_norm = (B[nonzero] / total[nonzero]).mean()
+
+        sig_accumulator += np.array([r_norm, g_norm, b_norm])
+        valid_patch_count += 1
+
+    if valid_patch_count == 0:
+        return None
+
+    return sig_accumulator / valid_patch_count  # 4 patch ortalaması
+
+
+def find_color_outlier(detections):
+    """
+    Aynı class_id'ye sahip tespitler arasında renk imzası outlier'ını bulur.
+
+    Algoritma:
+      - Her class için tespitleri grupla.
+      - Grupta 3+ nesne varsa:
+          * Her nesnenin imzası ile gruptaki diğerlerinin ortalaması
+            arasındaki Öklid mesafesini hesapla.
+          * En uzak olanı outlier işaretle.
+      - Grupta 2 nesne varsa: hangi class'taki mesafe daha büyükse o çift içinde
+        farklı olan outlier (ikisi de aynı derecede "uzak" olduğundan ikisini de işaretle).
+
+    Her detection dict'ine "color_sig", "is_color_outlier" anahtarları eklenir.
+    """
+    # Önce imzaları hesapla ve dict'e yaz
+    # (frame erişimi burada yok, imzalar dışarıda hesaplanıp geçilmeli;
+    #  bu fonksiyon sadece "color_sig" zaten dolu olan detections üzerinde çalışır)
+
+    # Class bazlı gruplama
+    from collections import defaultdict
+    class_groups = defaultdict(list)  # cls_id -> [idx, ...]
+
+    for i, det in enumerate(detections):
+        det.setdefault("is_color_outlier", False)
+        if det.get("color_sig") is not None:
+            class_groups[det["cls_id"]].append(i)
+
+    for cls_id, indices in class_groups.items():
+        if len(indices) < 2:
+            continue  # tek nesne, karşılaştırma yok
+
+        sigs = np.array([detections[i]["color_sig"] for i in indices])  # (N, 3)
+
+        if len(indices) == 2:
+            # Sadece 2 nesne: farkı hesapla, eşiğin üstündeyse her ikisini de değil,
+            # hiçbirini outlier yapma (hangisi farklı bilinmez); sadece fark bilgisini kaydet.
+            diff = np.linalg.norm(sigs[0] - sigs[1])
+            if diff > OUTLIER_MIN_DIFF:
+                # Hangisi "doğal" renk bilinmiyor; sadece bilgi amaçlı işaretle
+                # (isteğe bağlı davranış)
+                pass
+            continue
+
+        # 3+ nesne: her nesne için diğerlerinin ortalamasına uzaklık
+        distances = []
+        for i_local, idx in enumerate(indices):
+            others = np.delete(sigs, i_local, axis=0)
+            mean_others = others.mean(axis=0)
+            dist = np.linalg.norm(sigs[i_local] - mean_others)
+            distances.append(dist)
+
+        distances = np.array(distances)
+        max_dist_local = np.argmax(distances)
+        max_dist_val = distances[max_dist_local]
+
+        if max_dist_val > OUTLIER_MIN_DIFF:
+            outlier_global_idx = indices[max_dist_local]
+            detections[outlier_global_idx]["is_color_outlier"] = True
+
+    return detections
+
+
+def draw_color_patch_debug(frame, bbox, patch_ratio=PATCH_RATIO):
+    """
+    Debug: bbox üzerinde 4 patch bölgesini küçük dikdörtgen ile gösterir.
+    """
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    x1 = max(0, x1); y1 = max(0, y1)
+    x2 = min(frame.shape[1], x2); y2 = min(frame.shape[0], y2)
+    bw = x2 - x1; bh = y2 - y1
     pw = max(4, int(bw * patch_ratio))
     ph = max(4, int(bh * patch_ratio))
-
-    patches = []
-
-    # sol üst
-    patches.append(crop_patch(img, x1, y1, x1 + pw, y1 + ph))
-    # sağ üst
-    patches.append(crop_patch(img, x2 - pw, y1, x2, y1 + ph))
-    # sol alt
-    patches.append(crop_patch(img, x1, y2 - ph, x1 + pw, y2))
-    # sağ alt
-    patches.append(crop_patch(img, x2 - pw, y2 - ph, x2, y2))
-
-    return [p for p in patches if p is not None and p.size > 0]
+    color = (180, 180, 0)
+    cv2.rectangle(frame, (x1, y1), (x1 + pw, y1 + ph), color, 1)
+    cv2.rectangle(frame, (x2 - pw, y1), (x2, y1 + ph), color, 1)
+    cv2.rectangle(frame, (x1, y2 - ph), (x1 + pw, y2), color, 1)
+    cv2.rectangle(frame, (x2 - pw, y2 - ph), (x2, y2), color, 1)
 
 
-def mask_orange_pixels_bgr(patch):
-    """
-    Turuncu balonu kaba şekilde maskelemek için HSV tabanlı maske.
-    Turuncu bölgeler 0, diğerleri 1 olarak döner.
-    """
-    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+# =========================================================
+# 6) SİMÜLASYON DÖNGÜSÜ
+# =========================================================
+frame_count = 0
+print("Simülasyon başladı. Çıkmak için q bas.")
 
-    # Bu aralıklar senin görsellerine göre ince ayar ister.
-    lower_orange = np.array([5, 80, 80], dtype=np.uint8)
-    upper_orange = np.array([25, 255, 255], dtype=np.uint8)
+while True:
+    loop_start = time.time()
 
-    orange_mask = cv2.inRange(hsv, lower_orange, upper_orange)
-    keep_mask = (orange_mask == 0).astype(np.uint8)
-    return keep_mask
+    frame = np.zeros((SCREEN_H, SCREEN_W, 3), dtype=np.uint8)
+    draw_crosshair(frame)
 
+    t = frame_count / FPS
+    progress = (t % SIM_DURATION) / SIM_DURATION
+    scale = 0.08 + (progress ** 2) * 1.7
 
-def normalized_rgb_signature(patch, ignore_orange=True):
-    """
-    Patch için normalized RGB ortalaması üretir:
-        r = R/(R+G+B), g = G/(R+G+B), b = B/(R+G+B)
-    """
-    if patch is None or patch.size == 0:
-        return None
-
-    patch_rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB).astype(np.float32)
-
-    if ignore_orange:
-        keep_mask = mask_orange_pixels_bgr(patch)
-        valid = keep_mask > 0
-    else:
-        valid = np.ones(patch_rgb.shape[:2], dtype=bool)
-
-    pixels = patch_rgb[valid]
-    if len(pixels) < MIN_VALID_PIXELS:
-        return None
-
-    sums = pixels.sum(axis=1) + 1e-6
-    norm = pixels / sums[:, None]
-
-    mean_sig = norm.mean(axis=0)  # [r,g,b]
-    return mean_sig
-
-
-def bbox_color_signature(img, box, patch_ratio=0.20, ignore_orange=True):
-    """
-    4 köşe patch'in ortalamasını alıp nesnenin renk imzasını çıkarır.
-    """
-    patches = get_corner_patches(img, box, patch_ratio)
-    sigs = []
-
-    for p in patches:
-        sig = normalized_rgb_signature(p, ignore_orange=ignore_orange)
-        if sig is not None:
-            sigs.append(sig)
-
-    if len(sigs) == 0:
-        return None
-
-    sigs = np.array(sigs, dtype=np.float32)
-    return sigs.mean(axis=0)  # [r,g,b]
-
-
-def enemy_score(signature):
-    """
-    Kırmızı - mavi farkı.
-    Pozitifse kırmızı baskın, negatifse mavi baskın.
-    """
-    r, g, b = signature
-    return float(r - b)
-
-
-def classify_signature(signature):
-    """
-    Tek başına kaba sınıflandırma.
-    """
-    if signature is None:
-        return "unknown"
-
-    score = enemy_score(signature)
-
-    if score > RED_MARGIN:
-        return "enemy"
-    elif score < -BLUE_MARGIN:
-        return "friend"
-    return "uncertain"
-
-
-def outlier_index(signatures):
-    """
-    Basit outlier seçimi:
-    grubun ortalamasına en uzak imzayı döndürür.
-    """
-    arr = np.array(signatures, dtype=np.float32)
-    center = arr.mean(axis=0)
-    dists = np.linalg.norm(arr - center, axis=1)
-    return int(np.argmax(dists))
-
-
-def draw_box(img, box, text, color, thickness=2):
-    x1, y1, x2, y2 = map(int, box)
-    cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
-
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = 0.6
-    t = 2
-    (tw, th), _ = cv2.getTextSize(text, font, scale, t)
-    ty = max(20, y1 - 8)
-
-    cv2.rectangle(img, (x1, ty - th - 8), (x1 + tw + 8, ty), color, -1)
-    cv2.putText(img, text, (x1 + 4, ty - 4), font, scale, (255, 255, 255), t, cv2.LINE_AA)
-
-
-# =========================
-# ANA İŞLEM
-# =========================
-def run_detection_and_grouping():
-    model = YOLO(MODEL_PATH)
-
-    image_paths = sorted(glob.glob(os.path.join(IMAGE_DIR, "*.*")))
-    image_paths = [p for p in image_paths if p.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp"))]
-
-    if len(image_paths) == 0:
-        print("Görsel bulunamadı.")
-        return
-
-    all_dets = []
-
-    for img_path in image_paths:
-        img = cv2.imread(img_path)
-        if img is None:
+    for i, img in enumerate(images):
+        base_h, base_w = img.shape[:2]
+        new_w = int(base_w * scale)
+        new_h = int(base_h * scale)
+        if new_w < 8 or new_h < 8:
             continue
+        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        fg, mask = split_foreground_and_mask(resized)
+        x_offset = 80 * math.sin(t * (1.3 + i * 0.25))
+        y_offset = 45 * math.cos(t * (1.0 + i * 0.15) + i)
+        x = int(LANES[i] + x_offset - new_w / 2)
+        y = int(CENTER_Y + y_offset - new_h / 2)
+        overlay_safe(frame, fg, mask, x, y)
 
-        results = model.predict(
-            source=img,
-            conf=CONF_THRES,
-            iou=IOU_THRES,
-            verbose=False
+    # ----------------------------------------------------------
+    # 7) YOLO TESPİTİ
+    # ----------------------------------------------------------
+    results = model.predict(
+        source=frame,
+        imgsz=YOLO_IMGSZ,
+        conf=YOLO_CONF,
+        verbose=False
+    )
+
+    detections = []
+
+    if len(results) > 0:
+        r = results[0]
+        if r.boxes is not None:
+            for box in r.boxes:
+                xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                x1, y1, x2, y2 = xyxy.tolist()
+                cls_id = int(box.cls[0].item()) if box.cls is not None else -1
+                conf = float(box.conf[0].item()) if box.conf is not None else 0.0
+                class_name = model.names.get(cls_id, str(cls_id))
+
+                orange_info = detect_orange_center_in_bbox(frame, (x1, y1, x2, y2))
+
+                # --- YENİ: renk imzasını hesapla ---
+                color_sig = get_color_signature(frame, (x1, y1, x2, y2),
+                                                orange_mask_hsv=True)
+
+                detections.append({
+                    "bbox": (x1, y1, x2, y2),
+                    "cls_id": cls_id,
+                    "class_name": class_name,
+                    "conf": conf,
+                    "orange_info": orange_info,
+                    "color_sig": color_sig,
+                    "is_color_outlier": False,   # find_color_outlier dolduracak
+                })
+
+    # --- YENİ: outlier tespiti ---
+    detections = find_color_outlier(detections)
+
+    main_idx = choose_main_target(detections)
+
+    # ----------------------------------------------------------
+    # 8) ÇİZİM
+    # ----------------------------------------------------------
+    for i, det in enumerate(detections):
+        x1, y1, x2, y2 = det["bbox"]
+        name = det["class_name"]
+        conf = det["conf"]
+        orange_info = det["orange_info"]
+        is_outlier = det["is_color_outlier"]
+        color_sig = det["color_sig"]
+
+        if i == main_idx:
+            box_color = (0, 0, 255)     # kırmızı — ana hedef
+            txt_color = (0, 255, 0)
+        else:
+            box_color = (0, 255, 255)   # sarı
+            txt_color = (255, 255, 255)
+
+        # Outlier ise bbox çerçevesini magenta yap
+        if is_outlier:
+            box_color = (255, 0, 255)   # magenta — farklı renk!
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+        cv2.putText(
+            frame,
+            f"{name} {conf:.2f}",
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6, txt_color, 2
         )
 
-        if len(results) == 0:
-            continue
-
-        r = results[0]
-
-        boxes = r.boxes
-        if boxes is None or len(boxes) == 0:
-            continue
-
-        for b in boxes:
-            xyxy = b.xyxy[0].cpu().numpy()
-            cls_id = int(b.cls[0].cpu().numpy())
-            conf = float(b.conf[0].cpu().numpy())
-
-            x1, y1, x2, y2 = map(int, xyxy)
-            sig = bbox_color_signature(
-                img,
-                (x1, y1, x2, y2),
-                patch_ratio=PATCH_RATIO,
-                ignore_orange=IGNORE_ORANGE
+        # --- YENİ: renk imzasını ekrana yaz ---
+        if color_sig is not None:
+            r_n, g_n, b_n = color_sig
+            sig_text = f"r={r_n:.2f} g={g_n:.2f} b={b_n:.2f}"
+            cv2.putText(
+                frame, sig_text,
+                (x1, max(40, y1 - 28)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45, (200, 200, 200), 1
             )
 
-            det = {
-                "img_path": img_path,
-                "class_id": cls_id,
-                "class_name": model.names[cls_id] if hasattr(model, "names") else str(cls_id),
-                "conf": conf,
-                "box": (x1, y1, x2, y2),
-                "signature": sig,
-                "color_score": enemy_score(sig) if sig is not None else None,
-                "label": "unknown"
-            }
-            all_dets.append(det)
+        # --- YENİ: outlier etiketi ---
+        if is_outlier:
+            cv2.putText(
+                frame, "FARKLI RENK",
+                (x1, min(SCREEN_H - 10, y2 + 48)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7, (255, 0, 255), 2
+            )
 
-    # -------------------------
-    # Aynı class içindekileri grupla
-    # -------------------------
-    grouped = {}
-    for det in all_dets:
-        grouped.setdefault(det["class_id"], []).append(det)
+        # --- YENİ: debug — 4 patch köşelerini göster (isteğe bağlı) ---
+        draw_color_patch_debug(frame, (x1, y1, x2, y2))
 
-    for class_id, items in grouped.items():
-        valid_items = [it for it in items if it["signature"] is not None]
+        # Bbox merkezi
+        bx = (x1 + x2) // 2
+        by = (y1 + y2) // 2
+        cv2.circle(frame, (bx, by), 4, (255, 255, 0), -1)
 
-        if len(valid_items) == 0:
-            continue
+        # Turuncu merkez
+        if orange_info is not None:
+            gx, gy = orange_info["global_center"]
+            radius = int(orange_info["radius"])
+            circularity = orange_info["circularity"]
+            cv2.circle(frame, (gx, gy), max(3, radius), (0, 255, 0), 2)
+            cv2.circle(frame, (gx, gy), 3, (0, 255, 0), -1)
+            cv2.putText(
+                frame, f"C={circularity:.2f}",
+                (gx + 8, gy - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (0, 255, 0), 1
+            )
 
-        # Önce bireysel renk skoruna göre kaba etiketle
-        for it in valid_items:
-            it["label"] = classify_signature(it["signature"])
+        # Ana hedefe lock çizgisi
+        if i == main_idx:
+            target_x, target_y = bx, by
+            if orange_info is not None:
+                target_x, target_y = orange_info["global_center"]
+            cv2.line(frame, (CENTER_X, CENTER_Y), (target_x, target_y), (0, 255, 0), 2)
+            cv2.putText(
+                frame,
+                f"LOCKED | ERR X:{target_x - CENTER_X} Y:{target_y - CENTER_Y}",
+                (max(10, x1), min(SCREEN_H - 10, y2 + 25)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (0, 255, 0), 2
+            )
 
-        # İstersen outlier mantığını da ekle
-        if USE_OUTLIER_LOGIC and len(valid_items) >= 3:
-            sigs = [it["signature"] for it in valid_items]
-            oi = outlier_index(sigs)
-            outlier_item = valid_items[oi]
+    # Bilgi yazıları
+    sim_dist = round(15.0 * (1.0 - progress), 2)
+    cv2.putText(frame, f"Simule Mesafe: {sim_dist} m",
+                (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(frame, f"Detection Count: {len(detections)}",
+                (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-            # Outlier aynı zamanda kırmızı baskınsa enemy yap
-            if outlier_item["color_score"] is not None and outlier_item["color_score"] > RED_MARGIN:
-                outlier_item["label"] = "enemy"
+    # Outlier sayısını da yaz
+    outlier_count = sum(1 for d in detections if d["is_color_outlier"])
+    cv2.putText(frame, f"Color Outlier: {outlier_count}",
+                (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
 
-        # Son güvence:
-        # aynı class içinde en yüksek kırmızı-mavi skoru taşıyanı enemy kabul et
-        # ama sadece gerçekten kırmızı baskınsa
-        best_red_item = max(
-            valid_items,
-            key=lambda x: x["color_score"] if x["color_score"] is not None else -999
-        )
-        if best_red_item["color_score"] is not None and best_red_item["color_score"] > RED_MARGIN:
-            best_red_item["label"] = "enemy"
+    cv2.imshow("YOLO Simulation", frame)
 
-        # düşük kalanlar friend/uncertain olarak kalır
+    elapsed = time.time() - loop_start
+    wait_ms = max(1, int((1.0 / FPS - elapsed) * 1000))
 
-    return all_dets
+    key = cv2.waitKey(wait_ms) & 0xFF
+    if key == ord("q"):
+        break
 
+    frame_count += 1
 
-def render_results(all_dets):
-    by_image = {}
-    for det in all_dets:
-        by_image.setdefault(det["img_path"], []).append(det)
-
-    saved_paths = []
-
-    for img_path, dets in by_image.items():
-        img = cv2.imread(img_path)
-        if img is None:
-            continue
-
-        for det in dets:
-            label = det["label"]
-            sig = det["signature"]
-            score = det["color_score"]
-
-            if label == "enemy":
-                color = (0, 0, 255)      # kırmızı kutu
-            elif label == "friend":
-                color = (255, 0, 0)      # mavi kutu
-            elif label == "uncertain":
-                color = (0, 255, 255)    # sarı
-            else:
-                color = (180, 180, 180)  # gri
-
-            if sig is not None:
-                r, g, b = sig
-                text = f'{det["class_name"]} | {label} | s={score:.3f} | r={r:.2f} b={b:.2f}'
-            else:
-                text = f'{det["class_name"]} | {label} | no-signature'
-
-            draw_box(img, det["box"], text, color)
-
-        out_path = os.path.join(OUTPUT_DIR, os.path.basename(img_path))
-        cv2.imwrite(out_path, img)
-        saved_paths.append(out_path)
-
-    return saved_paths
-
-
-def simulate_sequence(image_paths, window_name="Simulation", delay_ms=1000):
-    """
-    Sonuç görsellerini sırayla gösterir.
-    q ile çıkılır.
-    """
-    for p in image_paths:
-        frame = cv2.imread(p)
-        if frame is None:
-            continue
-
-        cv2.imshow(window_name, frame)
-        key = cv2.waitKey(delay_ms) & 0xFF
-        if key == ord("q"):
-            break
-
-    cv2.destroyAllWindows()
-
-
-def main():
-    all_dets = run_detection_and_grouping()
-
-    if not all_dets:
-        print("Hiç detection bulunamadı.")
-        return
-
-    print("\n=== Detection Özeti ===")
-    for det in all_dets:
-        print({
-            "image": os.path.basename(det["img_path"]),
-            "class": det["class_name"],
-            "box": det["box"],
-            "score": det["color_score"],
-            "label": det["label"]
-        })
-
-    rendered = render_results(all_dets)
-
-    print("\nKaydedilen sonuçlar:")
-    for p in rendered:
-        print(p)
-
-    # Simülasyon gibi sırayla oynat
-    simulate_sequence(rendered, delay_ms=1200)
-
-
-if __name__ == "__main__":
-    main()
+cv2.destroyAllWindows()
