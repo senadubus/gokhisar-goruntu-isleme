@@ -1,0 +1,7 @@
+numpy==2.0.2
+opencv-python==4.10.0.84
+ultralytics==8.3.187
+pyserial==3.5
+scipy==1.13.1
+filterpy==1.4.5
+lapx==0.5.11

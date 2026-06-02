@@ -17,10 +17,10 @@ model = YOLO(MODEL_PATH)
 #    Bunları sen vereceksin
 # =========================================================
 IMAGE_PATHS = [
-    "target1.png",
-    "target2.png",
-    "target3.png",
-    "target4.png",
+    "images2/target1.png",
+    "images2/target2.png",
+    "images2/target3.png",
+    "images2/target4.png",
 ]
 
 images = []
